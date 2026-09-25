@@ -1,0 +1,132 @@
+name: Deploy to Raspberry Pi via Tailscale
+description: >-
+  Joins your tailnet as an ephemeral node, then rsyncs a directory from the
+  repository to a Raspberry Pi (or any SSH host) with optional pre/post-deploy
+  commands.
+branding:
+  icon: upload-cloud
+  color: red
+
+inputs:
+  # --- Tailscale -----------------------------------------------------------
+  tailscale-oauth-client-id:
+    description: Tailscale OAuth client ID (recommended). Needs the auth_keys write scope for the tags below.
+    required: false
+    default: ""
+  tailscale-oauth-secret:
+    description: Tailscale OAuth client secret.
+    required: false
+    default: ""
+  tailscale-authkey:
+    description: Tailscale auth key. Alternative to OAuth; use an ephemeral, reusable, pre-approved key.
+    required: false
+    default: ""
+  tailscale-tags:
+    description: Comma-separated tags the runner advertises. Required with OAuth. Set to "" for an untagged auth key.
+    required: false
+    default: tag:ci
+
+  # --- Target --------------------------------------------------------------
+  host:
+    description: Pi's Tailscale MagicDNS name (e.g. "raspberrypi" or "raspberrypi.tailnet-name.ts.net") or 100.x.y.z IP.
+    required: true
+  user:
+    description: SSH user on the Pi.
+    required: false
+    default: pi
+  ssh-port:
+    description: SSH port on the Pi.
+    required: false
+    default: "22"
+  ssh-key:
+    description: >-
+      Private SSH key authorised on the Pi. Leave empty if the Pi runs
+      Tailscale SSH (`tailscale up --ssh`) and your tailnet policy allows the runner's tag.
+    required: false
+    default: ""
+  known-hosts:
+    description: >-
+      known_hosts line(s) for the Pi (from `ssh-keyscan <host>`). Strongly recommended.
+      If empty, the host key is trusted on first use.
+    required: false
+    default: ""
+
+  # --- What to deploy ------------------------------------------------------
+  source:
+    description: Directory in the workspace to deploy. Its contents (not the directory itself) are copied into target.
+    required: false
+    default: "."
+  target:
+    description: Destination directory on the Pi. Created if missing.
+    required: true
+  delete:
+    description: Delete files on the Pi that no longer exist in source (rsync --delete). Excluded paths are left alone.
+    required: false
+    default: "false"
+  exclude:
+    description: Newline-separated rsync exclude patterns.
+    required: false
+    default: |
+      .git
+  rsync-args:
+    description: Extra arguments passed to rsync (whitespace-separated).
+    required: false
+    default: ""
+
+  # --- Hooks ---------------------------------------------------------------
+  pre-deploy:
+    description: Shell script run on the Pi (in target) before syncing. Runs under `bash -euo pipefail`.
+    required: false
+    default: ""
+  post-deploy:
+    description: Shell script run on the Pi (in target) after syncing, e.g. `sudo systemctl restart myapp`.
+    required: false
+    default: ""
+
+  # --- Behaviour -----------------------------------------------------------
+  dry-run:
+    description: Show what would change without changing anything. Hooks are skipped.
+    required: false
+    default: "false"
+  connect-attempts:
+    description: How many times to try reaching the Pi over SSH before failing (the tailnet can take a few seconds to settle).
+    required: false
+    default: "10"
+
+runs:
+  using: composite
+  steps:
+    - name: Check runner
+      shell: bash
+      run: |
+        if [[ "$RUNNER_OS" != "Linux" ]]; then
+          echo "::error::This action supports Linux runners only (got $RUNNER_OS)."
+          exit 1
+        fi
+
+    - name: Connect to Tailscale
+      uses: tailscale/github-action@v3
+      with:
+        oauth-client-id: ${{ inputs.tailscale-oauth-client-id }}
+        oauth-secret: ${{ inputs.tailscale-oauth-secret }}
+        authkey: ${{ inputs.tailscale-authkey }}
+        tags: ${{ inputs.tailscale-tags }}
+
+    - name: Deploy
+      shell: bash
+      env:
+        DEPLOY_HOST: ${{ inputs.host }}
+        DEPLOY_USER: ${{ inputs.user }}
+        DEPLOY_SSH_PORT: ${{ inputs.ssh-port }}
+        DEPLOY_SSH_KEY: ${{ inputs.ssh-key }}
+        DEPLOY_KNOWN_HOSTS: ${{ inputs.known-hosts }}
+        DEPLOY_SOURCE: ${{ inputs.source }}
+        DEPLOY_TARGET: ${{ inputs.target }}
+        DEPLOY_DELETE: ${{ inputs.delete }}
+        DEPLOY_EXCLUDE: ${{ inputs.exclude }}
+        DEPLOY_RSYNC_ARGS: ${{ inputs.rsync-args }}
+        DEPLOY_PRE: ${{ inputs.pre-deploy }}
+        DEPLOY_POST: ${{ inputs.post-deploy }}
+        DEPLOY_DRY_RUN: ${{ inputs.dry-run }}
+        DEPLOY_CONNECT_ATTEMPTS: ${{ inputs.connect-attempts }}
+      run: bash "$GITHUB_ACTION_PATH/scripts/deploy.sh"

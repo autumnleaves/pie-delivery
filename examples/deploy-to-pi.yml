@@ -1,0 +1,53 @@
+# Example workflow for a repo that deploys to a Pi.
+# Copy to .github/workflows/deploy-to-pi.yml in that repo and adjust.
+name: Deploy to Pi
+
+on:
+  push:
+    branches: [main]
+    paths: ["app/**"]
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: Show changes without deploying
+        type: boolean
+        default: false
+
+# Never run two deploys to the same Pi at once.
+concurrency:
+  group: deploy-pi
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: raspberry-pi   # optional: gate with approvals / scope secrets
+    steps:
+      - uses: actions/checkout@v5
+
+      # Build/test steps go here, e.g. npm ci && npm run build
+
+      - uses: YOUR-GITHUB-USER/pie-delivery@v1
+        with:
+          tailscale-oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          tailscale-oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tailscale-tags: tag:ci
+
+          host: raspberrypi
+          user: pi
+          ssh-key: ${{ secrets.PI_SSH_KEY }}
+          known-hosts: ${{ secrets.PI_KNOWN_HOSTS }}
+
+          source: app
+          target: /home/pi/app
+          delete: true
+          exclude: |
+            .git
+            node_modules
+            .env
+
+          post-deploy: |
+            sudo systemctl restart myapp
+            systemctl is-active myapp
+
+          dry-run: ${{ inputs.dry-run || false }}
