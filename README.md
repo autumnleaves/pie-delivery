@@ -139,6 +139,14 @@ steps:
       # ...
 ```
 
+## Testing
+
+The integration tests run `scripts/deploy.sh` against a throwaway SSH server in Docker. They use real `ssh` and `rsync`, and don't need a Pi or Tailscale. CI runs them on every push. To run them locally, start Docker and then run:
+
+```bash
+bash test/integration/run.sh
+```
+
 ## Releasing this action
 
 Consumers reference a tag. After you push changes:

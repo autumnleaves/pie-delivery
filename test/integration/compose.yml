@@ -1,0 +1,21 @@
+services:
+  # Stands in for the Raspberry Pi.
+  pi:
+    build: .
+    image: pie-delivery-test
+    volumes:
+      - deploy-target:/srv/deploy
+
+  # Stands in for the GitHub runner. Shares the target volume so the cases can
+  # inspect what landed on the "Pi" directly.
+  runner:
+    image: pie-delivery-test
+    depends_on: [pi]
+    volumes:
+      - ../..:/repo:ro
+      - deploy-target:/srv/deploy
+    working_dir: /repo
+    entrypoint: ["bash", "test/integration/cases.sh"]
+
+volumes:
+  deploy-target:
