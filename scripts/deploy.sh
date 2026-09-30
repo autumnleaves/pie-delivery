@@ -41,6 +41,8 @@ else
   ssh_opts+=(-o StrictHostKeyChecking=accept-new)
 fi
 
+# Callers build remote commands locally (with %q / base64), so client-side expansion is intended.
+# shellcheck disable=SC2029
 rsh() { ssh "${ssh_opts[@]}" "$remote" "$@"; }
 
 # Runs a script on the Pi inside the target directory. The script travels
@@ -110,6 +112,8 @@ echo "::group::rsync ${DEPLOY_SOURCE%/}/ -> $remote:$DEPLOY_TARGET"
 rsync "${rsync_opts[@]}" -e "$rsync_rsh" -- "${DEPLOY_SOURCE%/}/" "$remote:${DEPLOY_TARGET%/}/"
 echo "::endgroup::"
 
+# DEPLOY_POST is set via env in action.yml, not a typo of DEPLOY_HOST.
+# shellcheck disable=SC2153
 run_hook "post-deploy" "$DEPLOY_POST"
 
 if is_true "$DEPLOY_DRY_RUN"; then
