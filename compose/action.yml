@@ -1,0 +1,111 @@
+name: Deploy a Compose app via Tailscale
+description: >-
+  Joins your tailnet as an ephemeral node, ships a Docker Compose app's bundle to a host prepared
+  with pie-delivery's host/install.sh, and deploys it there with health checks and rollback.
+
+inputs:
+  # --- Tailscale -----------------------------------------------------------
+  tailscale-oauth-client-id:
+    description: >-
+      Client ID of a Tailscale federated identity (with tailscale-audience; recommended, and the job
+      needs `permissions: id-token: write`) or of an OAuth client (with tailscale-oauth-secret).
+    required: false
+    default: ""
+  tailscale-audience:
+    description: Audience of the Tailscale federated identity.
+    required: false
+    default: ""
+  tailscale-oauth-secret:
+    description: Tailscale OAuth client secret, if using an OAuth client instead of a federated identity.
+    required: false
+    default: ""
+  tailscale-authkey:
+    description: Tailscale auth key. Alternative to the above; use an ephemeral, reusable, pre-approved key.
+    required: false
+    default: ""
+  tailscale-tags:
+    description: Comma-separated tags the runner advertises.
+    required: false
+    default: tag:ci
+
+  # --- Target --------------------------------------------------------------
+  host:
+    description: The host's Tailscale name (e.g. "cargoship.tail1234.ts.net") or 100.x.y.z IP.
+    required: true
+  user:
+    description: SSH user on the host (host/install.sh's --user).
+    required: false
+    default: deploy
+  ssh-port:
+    description: SSH port on the host.
+    required: false
+    default: "22"
+  ssh-key:
+    description: >-
+      Private SSH key for the deploy user, if the host was set up with --ssh-key. Leave empty when
+      the host runs Tailscale SSH and the tailnet policy lets the runner's tag in.
+    required: false
+    default: ""
+  known-hosts:
+    description: known_hosts line(s) for the host, used with ssh-key. Not needed with Tailscale SSH.
+    required: false
+    default: ""
+
+  # --- What to deploy ------------------------------------------------------
+  app:
+    description: The app's name on the host (lowercase letters, digits, dashes). It lives in /opt/apps/<app>.
+    required: true
+  bundle:
+    description: Directory holding pie.json, the Compose project folders and optionally images/*.tar(.gz).
+    required: true
+  release:
+    description: Release name. Defaults to the commit SHA.
+    required: false
+    default: ${{ github.sha }}
+  secrets:
+    description: >-
+      KEY=VALUE lines added to each project's .env on the host (mode 600). Sent over SSH on stdin,
+      never in the bundle or on a command line.
+    required: false
+    default: ""
+
+  # --- Behaviour -----------------------------------------------------------
+  connect-attempts:
+    description: How many times to try reaching the host over SSH before failing.
+    required: false
+    default: "10"
+
+runs:
+  using: composite
+  steps:
+    - name: Check runner
+      shell: bash
+      run: |
+        if [[ "$RUNNER_OS" != "Linux" ]]; then
+          echo "::error::This action supports Linux runners only (got $RUNNER_OS)."
+          exit 1
+        fi
+
+    - name: Connect to Tailscale
+      uses: tailscale/github-action@v4
+      with:
+        oauth-client-id: ${{ inputs.tailscale-oauth-client-id }}
+        audience: ${{ inputs.tailscale-audience }}
+        oauth-secret: ${{ inputs.tailscale-oauth-secret }}
+        authkey: ${{ inputs.tailscale-authkey }}
+        tags: ${{ inputs.tailscale-tags }}
+
+    - name: Deploy
+      shell: bash
+      env:
+        DEPLOY_HOST: ${{ inputs.host }}
+        DEPLOY_USER: ${{ inputs.user }}
+        DEPLOY_SSH_PORT: ${{ inputs.ssh-port }}
+        DEPLOY_SSH_KEY: ${{ inputs.ssh-key }}
+        DEPLOY_KNOWN_HOSTS: ${{ inputs.known-hosts }}
+        DEPLOY_APP: ${{ inputs.app }}
+        DEPLOY_BUNDLE: ${{ inputs.bundle }}
+        DEPLOY_RELEASE: ${{ inputs.release }}
+        DEPLOY_SECRETS: ${{ inputs.secrets }}
+        DEPLOY_CONNECT_ATTEMPTS: ${{ inputs.connect-attempts }}
+      run: bash "$GITHUB_ACTION_PATH/../scripts/compose-deploy.sh"

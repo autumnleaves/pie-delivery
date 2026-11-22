@@ -1,0 +1,43 @@
+# Example workflow for a repo that deploys a Docker Compose app to a host set up with
+# host/install.sh. Copy to .github/workflows/deploy.yml in that repo and adjust.
+#
+# The repo needs a pie.json next to its Compose project (see the README); this example builds
+# one image in CI and ships it in the bundle, so the host never builds or pulls the app.
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # Tailscale workload identity federation: no Tailscale secret to store
+    # One deploy of this app at a time; queued ones wait rather than cancel.
+    concurrency:
+      group: deploy-myapp
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build the image and the bundle
+        run: |
+          docker build -t myapp:${{ github.sha }} .
+          mkdir -p bundle/images
+          cp -r stack pie.json bundle/
+          docker save myapp:${{ github.sha }} | gzip >bundle/images/myapp.tar.gz
+
+      - uses: YOUR-GITHUB-USER/pie-delivery/compose@v2
+        with:
+          # Not secret: a federated identity only accepts tokens GitHub issues for the repos it names.
+          tailscale-oauth-client-id: YOUR-FEDERATED-IDENTITY-CLIENT-ID
+          tailscale-audience: YOUR-FEDERATED-IDENTITY-AUDIENCE
+          host: myhost.tail1234.ts.net
+          app: myapp
+          bundle: bundle
+          # Only what this app needs; each becomes a line in its .env on the host.
+          secrets: |
+            API_TOKEN=${{ secrets.API_TOKEN }}
