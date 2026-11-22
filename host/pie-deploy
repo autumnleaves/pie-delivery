@@ -1,0 +1,354 @@
+#!/usr/bin/env bash
+# pie-deploy: deploys Docker Compose apps on a host prepared by host/install.sh.
+#
+# Installed as /usr/local/sbin/pie-deploy, owned by root. The `deploy` user may run it with
+# sudo, and nothing else. CI (compose/action.yml) rsyncs an app's bundle into
+# /var/lib/pie/incoming/<app>/<release>/ and then runs:
+#
+#   sudo pie-deploy deploy <app> <release>   < secrets     (KEY=VALUE lines, never argv)
+#
+# Other commands, for use by hand:
+#
+#   sudo pie-deploy rollback <app> [<release>]   back to the previous (or a named) release
+#   sudo pie-deploy status [<app>]               releases, and which is live
+#   pie-deploy --version
+#
+# A bundle is the app's Compose project folders plus `pie.json`:
+#
+#   {
+#     "projects": ["stack"],                        folders holding compose.yaml, in start order
+#     "health":   [{"network": "myapp_default",     URLs that must answer 2xx, polled from a
+#                   "url": "http://web:8080/health"}],  throwaway container on that network
+#     "dirs":     [{"path": "data", "owner": "1654:1654", "mode": "750"}],
+#                                                    persistent folders under /opt/apps/<app>/
+#     "mounts":   ["/mnt/media"],                   must be mounted, or nothing is deployed
+#     "keep":     3,                                 releases kept for rollback
+#     "timeout":  120                                seconds to wait for containers and health
+#   }
+#
+# and optionally images/*.tar or images/*.tar.gz, loaded with `docker load` (for images built
+# in CI rather than pulled). Every compose.yaml must set a top-level `name:`, so each release
+# takes over the previous release's containers.
+#
+# Each project's .env is its .env.example (if any), then APP_ROOT=/opt/apps/<app> and
+# RELEASE=<release>, then the secrets from stdin (mode 600). PIE_REGISTRY, PIE_REGISTRY_USER and
+# PIE_REGISTRY_TOKEN, if sent, log in to a registry for this deploy's pulls only and aren't
+# written anywhere.
+#
+# Releases live in /opt/apps/<app>/releases/<release>, with `current` pointing at the live one.
+# If the new release fails (containers not up, a health URL not answering), the previous one is
+# brought back and this exits 1.
+set -euo pipefail
+
+VERSION=2
+CLEANUP=()
+INCOMING_ROOT=${PIE_INCOMING_ROOT:-/var/lib/pie/incoming}
+APPS_ROOT=${PIE_APPS_ROOT:-/opt/apps}
+PROBE_IMAGE=${PIE_PROBE_IMAGE:-curlimages/curl:8.23.0}
+
+die() { echo "pie-deploy: $*" >&2; exit 1; }
+step() { echo "== $*"; }
+
+valid_app() { [[ $1 =~ ^[a-z0-9][a-z0-9-]{0,39}$ ]]; }
+valid_release() { [[ $1 =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; }
+valid_key() { [[ $1 =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; }
+
+usage() {
+    cat >&2 <<'USAGE'
+usage: pie-deploy deploy <app> <release>   < secrets (KEY=VALUE lines)
+       pie-deploy rollback <app> [<release>]
+       pie-deploy status [<app>]
+       pie-deploy --version
+USAGE
+    exit 2
+}
+
+need_root() { [ "$(id -u)" -eq 0 ] || die "run as root (sudo pie-deploy ...)"; }
+
+# Single quotes make Compose read the value literally (no $ interpolation).
+env_line() {
+    case $2 in *"'"* | *$'\n'*) die "$1 contains a single quote or a newline, which an env file can't carry" ;; esac
+    printf "%s='%s'\n" "$1" "$2"
+}
+
+# Runs docker compose for one project folder of a release. $1: release dir, $2: project.
+compose() {
+    local dir=$1/$2; shift 2
+    docker compose --project-directory "$dir" -f "$dir/compose.yaml" "$@"
+}
+
+manifest() { jq -r "$1" "$2/pie.json"; }
+
+# The projects of a release, one per line.
+projects() { manifest '.projects[]' "$1"; }
+
+# Waits for every health URL in a release's manifest to answer 2xx.
+health_ok() {
+    local rel=$1 timeout=$2 deadline count i network url
+    count=$(manifest '.health // [] | length' "$rel")
+    for ((i = 0; i < count; i++)); do
+        network=$(manifest ".health[$i].network" "$rel")
+        url=$(manifest ".health[$i].url" "$rel")
+        deadline=$((SECONDS + timeout))
+        until docker run --rm --network "$network" "$PROBE_IMAGE" -fsS -o /dev/null --max-time 5 "$url" >/dev/null 2>&1; do
+            if [ $SECONDS -ge $deadline ]; then
+                echo "not healthy after ${timeout}s: $url (network $network)"
+                return 1
+            fi
+            sleep 2
+        done
+        echo "healthy: $url"
+    done
+}
+
+# Brings a release's projects up and checks them.
+start_release() {
+    local rel=$1 timeout project
+    timeout=$(manifest '.timeout // 120' "$rel")
+    while read -r project; do
+        compose "$rel" "$project" up -d --remove-orphans --wait --wait-timeout "$timeout" || return 1
+    done < <(projects "$rel")
+    health_ok "$rel" "$timeout"
+}
+
+show_failure() {
+    local rel=$1 project
+    echo "Container state and recent logs:"
+    while read -r project; do
+        compose "$rel" "$project" ps -a || true
+        compose "$rel" "$project" logs --no-color --tail 60 || true
+    done < <(projects "$rel")
+}
+
+# Checks a bundle before anything on the host changes.
+check_bundle() {
+    local b=$1 project p
+    [ -f "$b/pie.json" ] || die "the bundle has no pie.json"
+    jq -e 'type == "object" and (.projects | type == "array" and length > 0)' "$b/pie.json" >/dev/null \
+        || die "pie.json needs a non-empty \"projects\" list"
+    while read -r project; do
+        [[ $project =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ && $project != *..* ]] \
+            || die "project folder '$project' must be a relative path inside the bundle"
+        [ -f "$b/$project/compose.yaml" ] || die "no $project/compose.yaml in the bundle"
+        grep -qE '^name:[[:space:]]*[a-z0-9]' "$b/$project/compose.yaml" \
+            || die "$project/compose.yaml must set a top-level name: (so releases replace each other)"
+    done < <(projects "$b")
+    while read -r p; do
+        [[ $p =~ ^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$ && $p != *..* ]] \
+            || die "dirs: '$p' must be a relative path (it's under $APPS_ROOT/<app>/)"
+        [[ $p != releases && $p != releases/* && $p != current ]] || die "dirs: '$p' is reserved"
+    done < <(manifest '.dirs // [] | .[].path' "$b")
+    jq -e '(.keep // 3 | type == "number" and . >= 1) and (.timeout // 120 | type == "number" and . > 0)' \
+        "$b/pie.json" >/dev/null || die "pie.json: keep must be 1 or more and timeout above 0"
+}
+
+cmd_deploy() {
+    need_root
+    local app=${1:-} release=${2:-}
+    valid_app "$app" || die "app must be lowercase letters, digits and dashes (got '$app')"
+    valid_release "$release" || die "release must be letters, digits, dots, dashes or underscores (got '$release')"
+
+    local incoming=$INCOMING_ROOT/$app/$release
+    local root=$APPS_ROOT/$app
+    local rel=$root/releases/$release
+    [ -d "$incoming" ] || die "no bundle at $incoming (CI rsyncs it there first)"
+    # The bundle is CI's to replace; it's gone once this finishes, whatever happens. (Globals:
+    # the trap runs after this function's locals are gone.)
+    CLEANUP=("$incoming")
+    trap 'rm -rf -- "${CLEANUP[@]}"' EXIT
+
+    exec 9>"/run/lock/pie-deploy-$app.lock"
+    flock -w 600 9 || die "another deploy of $app is still running"
+
+    # Secrets arrive on stdin. They're validated before anything changes.
+    declare -A secrets=()
+    local line key
+    if [ ! -t 0 ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            [ -z "$line" ] && continue
+            key=${line%%=*}
+            if [[ $line != *=* ]] || ! valid_key "$key"; then die "secrets: expected KEY=VALUE lines"; fi
+            secrets[$key]=${line#*=}
+        done
+    fi
+
+    step "Checking the bundle"
+    check_bundle "$incoming"
+    local mount
+    while read -r mount; do
+        # Listing the path triggers an automount.
+        if ! { ls "$mount/" >/dev/null 2>&1 && mountpoint -q "$mount"; }; then
+            die "$mount isn't mounted: not deploying"
+        fi
+    done < <(manifest '.mounts // [] | .[]' "$incoming")
+
+    step "Release $release of $app"
+    install -d -m 755 "$root" "$root/releases"
+    rm -rf -- "$rel"
+    install -d -m 755 "$rel"
+    # -P: symlinks in the bundle stay symlinks rather than being followed.
+    cp -RP -- "$incoming/." "$rel/"
+    rm -rf -- "$rel/images"
+    chown -R root:root "$rel"
+    chmod -R a+rX,go-w "$rel"
+
+    local i count path owner mode
+    count=$(manifest '.dirs // [] | length' "$rel")
+    for ((i = 0; i < count; i++)); do
+        path=$(manifest ".dirs[$i].path" "$rel")
+        owner=$(manifest ".dirs[$i].owner // \"root:root\"" "$rel")
+        mode=$(manifest ".dirs[$i].mode // \"755\"" "$rel")
+        # Created once with these settings; an existing folder is left as it is.
+        [ -d "$root/$path" ] || install -d -m "$mode" -o "${owner%%:*}" -g "${owner##*:}" "$root/$path"
+    done
+
+    local project env_file
+    local reserved='^(APP_ROOT|RELEASE|PIE_REGISTRY|PIE_REGISTRY_USER|PIE_REGISTRY_TOKEN)$'
+    # .env.example lines that these settings or the secrets replace.
+    local drop="APP_ROOT|RELEASE"
+    for key in "${!secrets[@]}"; do drop+="|$key"; done
+    while read -r project; do
+        env_file=$rel/$project/.env
+        (
+            umask 077
+            {
+                if [ -f "$rel/$project/.env.example" ]; then
+                    grep -vE "^($drop)=" "$rel/$project/.env.example" || true
+                fi
+                env_line APP_ROOT "$root"
+                env_line RELEASE "$release"
+                for key in "${!secrets[@]}"; do
+                    [[ $key =~ $reserved ]] || env_line "$key" "${secrets[$key]}"
+                done
+            } >"$env_file"
+        )
+    done < <(projects "$rel")
+
+    # Images built in CI.
+    : >"$rel/.pie-images"
+    local image
+    shopt -s nullglob
+    for image in "$incoming"/images/*.tar "$incoming"/images/*.tar.gz; do
+        step "Loading $(basename "$image")"
+        if [[ $image == *.gz ]]; then gunzip -c "$image"; else cat "$image"; fi \
+            | docker load | sed -n 's/^Loaded image: //p' | tee -a "$rel/.pie-images"
+    done
+    shopt -u nullglob
+
+    # A registry login for this deploy only, in a throwaway Docker config.
+    local docker_config=""
+    if [ -n "${secrets[PIE_REGISTRY_TOKEN]:-}" ]; then
+        docker_config=$(mktemp -d)
+        CLEANUP+=("$docker_config")
+        printf '%s' "${secrets[PIE_REGISTRY_TOKEN]}" | DOCKER_CONFIG=$docker_config docker login \
+            "${secrets[PIE_REGISTRY]:-ghcr.io}" -u "${secrets[PIE_REGISTRY_USER]:-pie}" --password-stdin >/dev/null
+    fi
+
+    step "Pulling and building images"
+    # Images loaded from the bundle aren't in any registry: with any, only images that are
+    # missing are pulled (so pin other images' tags rather than using `latest`).
+    local policy=always
+    [ -s "$rel/.pie-images" ] && policy=missing
+    while read -r project; do
+        DOCKER_CONFIG=${docker_config:-${DOCKER_CONFIG:-$HOME/.docker}} \
+            compose "$rel" "$project" pull --quiet --ignore-buildable --policy "$policy"
+        if compose "$rel" "$project" config --format json | jq -e '[.services[] | has("build")] | any' >/dev/null; then
+            DOCKER_CONFIG=${docker_config:-${DOCKER_CONFIG:-$HOME/.docker}} \
+                compose "$rel" "$project" build --pull --quiet
+        fi
+    done < <(projects "$rel")
+    docker pull -q "$PROBE_IMAGE" >/dev/null 2>&1 || true
+
+    local prev
+    prev=$(readlink -e "$root/current" 2>/dev/null || true)
+    [ "$prev" = "$rel" ] && prev=""
+    step "Starting $app $release${prev:+, replacing $(basename "$prev")}"
+
+    if start_release "$rel"; then
+        ln -sfn "$rel" "$root/current"
+        while read -r project; do compose "$rel" "$project" ps; done < <(projects "$rel")
+        echo "deployed $app $release"
+    else
+        echo "deploy of $app $release failed."
+        show_failure "$rel"
+        if [ -n "$prev" ] && [ -d "$prev" ]; then
+            echo "rolling back to $(basename "$prev")"
+            if start_release "$prev"; then echo "rolled back"; else echo "ROLLBACK ALSO FAILED"; fi
+        else
+            echo "no previous release to roll back to"
+        fi
+        exit 1
+    fi
+
+    prune "$app"
+}
+
+# Keeps the newest `keep` releases (and the live one), and the images loaded for them.
+prune() {
+    local app=$1 root=$APPS_ROOT/$1 current keep old image
+    current=$(readlink -f "$root/current")
+    keep=$(manifest '.keep // 3' "$current")
+    local -a kept=()
+    # shellcheck disable=SC2012 # release names are validated: no spaces or newlines
+    while read -r old; do kept+=("$old"); done < <(ls -1t "$root/releases" | head -n "$keep")
+    kept+=("$(basename "$current")")
+
+    local -A in_use=()
+    for old in "${kept[@]}"; do
+        while read -r image; do [ -n "$image" ] && in_use[$image]=1; done <"$root/releases/$old/.pie-images" 2>/dev/null || true
+    done
+    while read -r old; do
+        [[ " ${kept[*]} " == *" $old "* ]] && continue
+        while read -r image; do
+            [ -n "$image" ] && [ -z "${in_use[$image]:-}" ] && docker image rm "$image" >/dev/null 2>&1 || true
+        done <"$root/releases/$old/.pie-images" 2>/dev/null || true
+        rm -rf -- "${root:?}/releases/$old"
+    done < <(ls -1 "$root/releases")
+    docker image prune -f >/dev/null
+}
+
+cmd_rollback() {
+    need_root
+    local app=${1:-} target=${2:-} root rel current
+    valid_app "$app" || die "usage: pie-deploy rollback <app> [<release>]"
+    root=$APPS_ROOT/$app
+    exec 9>"/run/lock/pie-deploy-$app.lock"
+    flock -w 600 9 || die "a deploy of $app is running"
+    current=$(readlink -f "$root/current" 2>/dev/null || true)
+    if [ -n "$target" ]; then
+        valid_release "$target" || die "not a release name: $target"
+        rel=$root/releases/$target
+    else
+        # The newest release that isn't the live one.
+        # shellcheck disable=SC2012 # release names are validated: no spaces or newlines
+        rel=$(ls -1td "$root"/releases/*/ 2>/dev/null | sed 's#/$##' | grep -vxF "$current" | head -n1 || true)
+    fi
+    [ -n "$rel" ] && [ -d "$rel" ] || die "no release to roll back to (pie-deploy status $app)"
+    step "Rolling $app back to $(basename "$rel")"
+    start_release "$rel" || { show_failure "$rel"; die "that release didn't start either"; }
+    ln -sfn "$rel" "$root/current"
+    echo "now live: $app $(basename "$rel")"
+}
+
+cmd_status() {
+    local app=${1:-} a current r
+    if [ -z "$app" ]; then
+        for a in "$APPS_ROOT"/*/; do [ -d "$a/releases" ] && cmd_status "$(basename "$a")"; done
+        return 0
+    fi
+    valid_app "$app" || die "not an app name: $app"
+    [ -d "$APPS_ROOT/$app/releases" ] || die "no app called $app"
+    current=$(basename "$(readlink -f "$APPS_ROOT/$app/current" 2>/dev/null || echo none)")
+    echo "$app"
+    while read -r r; do
+        printf '  %s %s\n' "$([ "$r" = "$current" ] && echo '*' || echo ' ')" "$r"
+    done < <(ls -1t "$APPS_ROOT/$app/releases")
+}
+
+case ${1:-} in
+    deploy) shift; cmd_deploy "$@" ;;
+    rollback) shift; cmd_rollback "$@" ;;
+    status) shift; cmd_status "$@" ;;
+    --version | version) echo "pie-deploy $VERSION" ;;
+    *) usage ;;
+esac

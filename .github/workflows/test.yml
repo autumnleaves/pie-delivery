@@ -11,3 +11,11 @@ jobs:
       - uses: actions/checkout@v5
       - name: Deploy integration tests (sshd in Docker)
         run: bash test/integration/run.sh
+
+  host:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: pie-deploy against Docker (Compose projects, rollback, pruning)
+        # sudo resets PATH; keep the runner's, for go.
+        run: sudo env "PATH=$PATH" bash test/host/run.sh

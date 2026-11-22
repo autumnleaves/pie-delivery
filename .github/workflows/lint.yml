@@ -11,7 +11,7 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: shellcheck
-        run: shellcheck scripts/*.sh test/integration/*.sh
+        run: shellcheck scripts/*.sh test/integration/*.sh test/host/*.sh host/install.sh host/pie-deploy
 
       - name: actionlint
         run: |

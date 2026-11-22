@@ -10,11 +10,18 @@ branding:
 inputs:
   # --- Tailscale -----------------------------------------------------------
   tailscale-oauth-client-id:
-    description: Tailscale OAuth client ID (recommended). Needs the auth_keys write scope for the tags below.
+    description: >-
+      Client ID of a Tailscale federated identity (with tailscale-audience; recommended, and the job
+      needs `permissions: id-token: write`) or of an OAuth client (with tailscale-oauth-secret).
+      Needs the auth_keys write scope for the tags below.
+    required: false
+    default: ""
+  tailscale-audience:
+    description: Audience of the Tailscale federated identity (workload identity federation).
     required: false
     default: ""
   tailscale-oauth-secret:
-    description: Tailscale OAuth client secret.
+    description: Tailscale OAuth client secret, if using an OAuth client.
     required: false
     default: ""
   tailscale-authkey:
@@ -105,9 +112,10 @@ runs:
         fi
 
     - name: Connect to Tailscale
-      uses: tailscale/github-action@v3
+      uses: tailscale/github-action@v4
       with:
         oauth-client-id: ${{ inputs.tailscale-oauth-client-id }}
+        audience: ${{ inputs.tailscale-audience }}
         oauth-secret: ${{ inputs.tailscale-oauth-secret }}
         authkey: ${{ inputs.tailscale-authkey }}
         tags: ${{ inputs.tailscale-tags }}
