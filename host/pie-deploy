@@ -79,6 +79,30 @@ compose() {
 
 manifest() { jq -r "$1" "$2/pie.json"; }
 
+# Loading, pulling and pruning images take a host-wide lock (fd 8): a `docker image prune` in
+# one deploy while another is mid-`docker load` deletes the layers being written ("lease does
+# not exist"). Starting containers and health checks don't need it.
+images_lock() {
+    exec 8>/run/lock/pie-deploy-images.lock
+    flock -w 900 8 || die "another deploy has held the image lock for 15 minutes"
+}
+images_unlock() { flock -u 8; }
+
+# docker load, retried once: deploys that don't use pie-deploy (and so don't take the lock) can
+# still prune underneath it. $1: image file. Prints the loaded image names.
+load_image() {
+    local attempt out
+    for attempt in 1 2; do
+        if out=$(if [[ $1 == *.gz ]]; then gunzip -c "$1"; else cat "$1"; fi | docker load 2>&1); then
+            sed -n 's/^Loaded image: //p' <<<"$out"
+            return 0
+        fi
+        echo "$out" >&2
+        [ $attempt = 1 ] && { echo "docker load failed; retrying in 5s" >&2; sleep 5; }
+    done
+    return 1
+}
+
 # The projects of a release, one per line.
 projects() { manifest '.projects[]' "$1"; }
 
@@ -224,14 +248,16 @@ cmd_deploy() {
         )
     done < <(projects "$rel")
 
+    images_lock
+
     # Images built in CI.
     : >"$rel/.pie-images"
     local image
     shopt -s nullglob
     for image in "$incoming"/images/*.tar "$incoming"/images/*.tar.gz; do
         step "Loading $(basename "$image")"
-        if [[ $image == *.gz ]]; then gunzip -c "$image"; else cat "$image"; fi \
-            | docker load | sed -n 's/^Loaded image: //p' | tee -a "$rel/.pie-images"
+        load_image "$image" | tee -a "$rel/.pie-images"
+        [ "${PIPESTATUS[0]}" -eq 0 ] || die "couldn't load $(basename "$image")"
     done
     shopt -u nullglob
 
@@ -258,6 +284,7 @@ cmd_deploy() {
         fi
     done < <(projects "$rel")
     docker pull -q "$PROBE_IMAGE" >/dev/null 2>&1 || true
+    images_unlock
 
     local prev
     prev=$(readlink -e "$root/current" 2>/dev/null || true)
@@ -293,6 +320,7 @@ prune() {
     while read -r old; do kept+=("$old"); done < <(ls -1t "$root/releases" | head -n "$keep")
     kept+=("$(basename "$current")")
 
+    images_lock
     local -A in_use=()
     for old in "${kept[@]}"; do
         while read -r image; do [ -n "$image" ] && in_use[$image]=1; done <"$root/releases/$old/.pie-images" 2>/dev/null || true
@@ -305,6 +333,7 @@ prune() {
         rm -rf -- "${root:?}/releases/$old"
     done < <(ls -1 "$root/releases")
     docker image prune -f >/dev/null
+    images_unlock
 }
 
 cmd_rollback() {
